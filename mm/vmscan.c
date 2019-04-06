@@ -867,7 +867,8 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 		 * end of the LRU a second time.
 		 */
 		mapping = page_mapping(page);
-		if ((mapping && bdi_write_congested(mapping->backing_dev_info)) ||
+		if (((dirty || writeback) && mapping &&
+		     bdi_write_congested(mapping->backing_dev_info)) ||
 		    (writeback && PageReclaim(page)))
 			nr_congested++;
 
@@ -1955,6 +1956,8 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	bool force_scan = false;
 	unsigned long ap, fp;
 	enum lru_list lru;
+	bool some_scanned;
+	int pass;
 
 	/*
 	 * If the zone or memcg is small, nr[l] can be 0.  This
@@ -2075,39 +2078,49 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	fraction[1] = fp;
 	denominator = ap + fp + 1;
 out:
-	for_each_evictable_lru(lru) {
-		int file = is_file_lru(lru);
-		unsigned long size;
-		unsigned long scan;
+	some_scanned = false;
+	/* Only use force_scan on second pass. */
+	for (pass = 0; !some_scanned && pass < 2; pass++) {
+		for_each_evictable_lru(lru) {
+			int file = is_file_lru(lru);
+			unsigned long size;
+			unsigned long scan;
 
-		size = get_lru_size(lruvec, lru);
-		scan = size >> sc->priority;
+			size = get_lru_size(lruvec, lru);
+			scan = size >> sc->priority;
 
-		if (!scan && force_scan)
-			scan = min(size, SWAP_CLUSTER_MAX);
+			if (!scan && pass && force_scan)
+				scan = min(size, SWAP_CLUSTER_MAX);
 
-		switch (scan_balance) {
-		case SCAN_EQUAL:
-			/* Scan lists relative to size */
-			break;
-		case SCAN_FRACT:
+			switch (scan_balance) {
+			case SCAN_EQUAL:
+				/* Scan lists relative to size */
+				break;
+			case SCAN_FRACT:
+				/*
+				 * Scan types proportional to swappiness and
+				 * their relative recent reclaim efficiency.
+				 */
+				scan = div64_u64(scan * fraction[file],
+							denominator);
+				break;
+			case SCAN_FILE:
+			case SCAN_ANON:
+				/* Scan one type exclusively */
+				if ((scan_balance == SCAN_FILE) != file)
+					scan = 0;
+				break;
+			default:
+				/* Look ma, no brain */
+				BUG();
+			}
+			nr[lru] = scan;
 			/*
-			 * Scan types proportional to swappiness and
-			 * their relative recent reclaim efficiency.
+			 * Skip the second pass and don't force_scan,
+			 * if we found something to scan.
 			 */
-			scan = div64_u64(scan * fraction[file], denominator);
-			break;
-		case SCAN_FILE:
-		case SCAN_ANON:
-			/* Scan one type exclusively */
-			if ((scan_balance == SCAN_FILE) != file)
-				scan = 0;
-			break;
-		default:
-			/* Look ma, no brain */
-			BUG();
+			some_scanned |= !!scan;
 		}
-		nr[lru] = scan;
 	}
 }
 
@@ -3457,7 +3470,7 @@ void wakeup_kswapd(struct zone *zone, int order, enum zone_type classzone_idx)
 	}
 	if (!waitqueue_active(&pgdat->kswapd_wait))
 		return;
-	if (zone_watermark_ok_safe(zone, order, low_wmark_pages(zone), 0, 0))
+	if (zone_balanced(zone, order, 0, 0))
 		return;
 
 	trace_mm_vmscan_wakeup_kswapd(pgdat->node_id, zone_idx(zone), order);
